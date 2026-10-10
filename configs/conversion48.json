@@ -1,0 +1,8 @@
+{
+  "horizon": 48,
+  "stride": 8,
+  "history_frames": 9,
+  "image_source": "auto",
+  "action_keys": ["joint_action/vector"],
+  "expected_action_dim": 14
+}

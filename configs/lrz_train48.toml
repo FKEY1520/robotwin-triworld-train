@@ -1,0 +1,53 @@
+# 复用现有 LRZ 自研模型 1.0：先替换 /CHANGE_ME，再编码，最后运行原训练器。
+# 本文件的 data.manifest 为转换结果 dataset.json，不能调用原 triviwan.cache。
+[paths]
+wan_source = "/dss/dssfs05/pn39qo/pn39qo-dss-0001/di97fer/triviwan_repro/src/Wan2.2-1ea34ff48f87-snapshot"
+checkpoint = "/dss/dssfs05/pn39qo/pn39qo-dss-0001/di97fer/triviwan_repro/models/Wan2.2-TI2V-5B-native"
+text_device = "cpu"
+
+[runtime]
+device = "cuda"
+
+[data]
+manifest = "/CHANGE_ME/training_data/dataset.json"
+cache_dir = "/CHANGE_ME/cache/train48_v1"
+split = "train"
+height = 256
+width = 320
+window_future = 48
+action_padding = "hold"
+
+[model]
+action_dim = 14
+cross_view_every = 5
+cross_view_dim = 256
+heads = 8
+kv_pool = 4
+gradient_checkpointing = true
+
+[diffusion]
+shift = 3.0
+
+[history]
+num_frames = 9
+noise_sigma = 0.0
+
+[train]
+mode = "adapters"
+output_dir = "/CHANGE_ME/runs/train48_v1"
+# 起步实验预算；正式步数由已有独立验证集决定。
+steps = 1000
+lr = 0.00001
+warmup = 50
+weight_decay = 0.01
+grad_accum = 4
+grad_clip = 1.0
+text_dropout = 0.1
+save_every = 100
+seed = 42
+
+[inference]
+chunk_future = 48
+steps = 50
+guidance = 5.0
+seed = 42
