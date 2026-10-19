@@ -158,19 +158,48 @@ def fit_normalizer(sequences):
             "eps": 1e-8, "constant_policy": "zero", "statistics": {"unique_frames": len(values), "episode_count": len(sequences), "overlap_weighted": False}}
 
 
+def _load_entries(bundle, limit=0, check_inventory=False):
+    payload = read_json(Path(bundle) / "robotwin_episode_mapping.json")
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"Mapping must contain nonempty entries: {bundle}")
+    names = []
+    for entry in entries:
+        name = entry.get("new_episode") if isinstance(entry, dict) else None
+        if not isinstance(name, str) or re.fullmatch(r"episode\d+", name) is None:
+            raise ValueError(f"Invalid mapped episode ID: {bundle}")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError(f"Mapping contains duplicate episodes: {bundle}")
+    if check_inventory:
+        directory = Path(bundle) / "test_dataset" / "data"
+        actual = {p.name for p in directory.iterdir() if p.is_file() and p.suffix.lower() in {".h5", ".hdf5"}}
+        expected = {name + ".hdf5" for name in names}
+        if actual != expected:
+            raise ValueError(f"Mapping/data inventory mismatch: {bundle}; unmapped={sorted(actual - expected)}, missing={sorted(expected - actual)}")
+    entries = sorted(entries, key=lambda e: int(e["new_episode"][7:]))
+    return entries[:limit] if limit else entries
+
+
 def inspect(source_root, tasks=None, limit=0, horizon=48, stride=8, history_frames=9,
-            image_source="auto", action_keys=(ACTION_KEY,), expected_action_dim=14):
+            image_source="auto", action_keys=(ACTION_KEY,), expected_action_dim=14, recursive=False):
     if type(limit) is not int or limit < 0:
         raise ValueError("limit must be a nonnegative integer")
     window_starts(horizon + 1, horizon, stride)
     result = {"bundles": [], "episode_count": 0, "frame_count": 0, "window_count": 0, "horizon": horizon, "stride": stride}
     history_indices(1, history_frames)
-    for bundle in discover_bundles(source_root, tasks):
-        entries = read_json(bundle / "robotwin_episode_mapping.json")["entries"]
-        entries = sorted(entries, key=lambda e: int(e["new_episode"][7:]))
-        if limit:
-            entries = entries[:limit]
+    if recursive:
+        from .discovery import discover_tree
+        sources = [(item.path, item.dataset_id, item.relative_path) for item in discover_tree(source_root, tasks)]
+    else:
+        sources = [(path, path.name, path.name) for path in discover_bundles(source_root, tasks)]
+    if not sources:
+        raise ValueError(f"No converted RoboTwin bundles under {source_root}")
+    for bundle, dataset_id, relative_path in sources:
+        entries = _load_entries(bundle, limit, check_inventory=recursive)
         row = {"bundle": bundle.name, "episode_count": len(entries), "frame_count": 0, "window_count": 0, "image_encodings": []}
+        if recursive:
+            row.update(dataset_id=dataset_id, source_relative_path=relative_path)
         for entry in entries:
             data, _ = _read_episode(bundle, entry, action_keys, expected_action_dim, image_source)
             starts = window_starts(len(data.actions), horizon, stride)
@@ -186,6 +215,7 @@ def inspect(source_root, tasks=None, limit=0, horizon=48, stride=8, history_fram
         for key in ("episode_count", "frame_count", "window_count"):
             result[key] += row[key]
     result["image_decode_verified"] = False
+    result["recursive"] = recursive
     return result
 
 
@@ -231,6 +261,9 @@ def _write_manifest(root, episodes, windows, settings, sequences, bundle_names):
     write_json(root / "normalizer.json", fit_normalizer(sequences))
     manifest["normalizer_sha256"] = sha256(root / "normalizer.json")
     write_json(root / "dataset.json", manifest)
+    counts = {}
+    for window in windows:
+        counts[window["episode_id"]] = counts.get(window["episode_id"], 0) + 1
     report = {"episode_count": len(episodes), "frame_count": sum(e["frame_count"] for e in episodes), "window_count": len(windows),
               "horizon": settings["horizon"], "stride": settings["stride"], "history_frames": settings["history_frames"],
               "train_count": len(windows), "validation_count": 0, "test_count": 0,
@@ -238,10 +271,54 @@ def _write_manifest(root, episodes, windows, settings, sequences, bundle_names):
               "image_decode_verified": True, "normalizer_uses_unique_timesteps": True, "bundles": bundle_names,
               "storage_bytes": sum((root / e["file"]).stat().st_size for e in episodes),
               "settings": settings, "episodes": [{"episode_id": e["episode_id"], "frame_count": e["frame_count"],
-                 "window_count": sum(w["episode_id"] == e["episode_id"] for w in windows),
+                 "window_count": counts.get(e["episode_id"], 0),
                  "last_future_start": e["frame_count"] - settings["horizon"], "last_target_frame": e["frame_count"] - 1} for e in episodes]}
     write_json(root / "report.json", report)
     return report
+
+
+def _convert_bundle(bundle, root, settings, hook=None, transform=None, dataset_id=None,
+                    limit=0, check_inventory=False, source_relative_path=None):
+    """Build one self-contained bundle; caller publishes its directory atomically."""
+    bundle, root = Path(bundle), Path(root)
+    dataset_id = dataset_id or bundle.name
+    (root / "episodes").mkdir(parents=True, exist_ok=False)
+    entries = _load_entries(bundle, limit, check_inventory)
+    episodes, windows, sequences = [], [], []
+    horizon, stride = settings["horizon"], settings["stride"]
+    for number, entry in enumerate(entries, 1):
+        data, action_source = _read_episode(bundle, entry, settings["action_keys"], settings["expected_action_dim"], settings["image_source"])
+        provenance = dict(data.metadata)
+        if hook:
+            data = hook(data)
+        data = _validate_episode(data, settings["expected_action_dim"])
+        provenance["transformed"] = hook is not None
+        if hook:
+            provenance["transform_metadata"] = data.metadata
+            if isinstance(transform, str):
+                provenance["transform_sha256"] = sha256(Path(transform.rpartition(":")[0]).resolve())
+        if source_relative_path is not None:
+            provenance["source_relative_path"] = source_relative_path
+        if len(data.actions) != entry.get("frame_count", len(data.actions)):
+            raise ValueError("Transform cannot change frame count; configure a new source bundle for resampling")
+        starts = window_starts(len(data.actions), horizon, stride)
+        episode_id = dataset_id + "__" + entry["new_episode"]
+        filename = "episodes/" + entry["new_episode"] + ".h5"
+        image_shape = _store_episode(root / filename, data, action_source)
+        source_uid = "sha256:" + provenance["source_action_sha256"]
+        record = {"episode_id": episode_id, "source_uid": source_uid, "split": "train", "source_role": "training",
+                  "task": provenance["task"], "bundle": dataset_id, "file": filename, "file_sha256": sha256(root / filename),
+                  "frame_count": len(data.actions), "action_dim": settings["expected_action_dim"], "action_dtype": str(data.actions.dtype),
+                  "image_shape": image_shape, "prompt": data.prompt, "provenance": provenance}
+        episodes.append(record)
+        sequences.append(data.actions)
+        for start in starts:
+            windows.append({"sample_id": episode_id + f"__f{start:06d}", "episode_id": episode_id, "source_uid": source_uid,
+                            "split": "train", "bundle": dataset_id, "task": record["task"], "future_start": start, "horizon": horizon,
+                            "history_indices": history_indices(start, settings["history_frames"]), "target_end_exclusive": start + horizon})
+        print(f"[{dataset_id}] {number}/{len(entries)} {entry['new_episode']}: {len(data.actions)} frames -> {len(starts)} windows", flush=True)
+    report = _write_manifest(root, episodes, windows, settings, sequences, [dataset_id])
+    return episodes, windows, sequences, report
 
 
 def convert(source_root, output_root, horizon=48, stride=8, history_frames=9, image_source="auto",
@@ -270,46 +347,7 @@ def convert(source_root, output_root, horizon=48, stride=8, history_frames=9, im
     try:
         for bundle in bundles:
             root = stage / bundle.name
-            (root / "episodes").mkdir(parents=True)
-            entries = read_json(bundle / "robotwin_episode_mapping.json")["entries"]
-            entries = sorted(entries, key=lambda e: int(e["new_episode"][7:]))
-            if limit:
-                entries = entries[:limit]
-            if not entries or len({e["new_episode"] for e in entries}) != len(entries):
-                raise ValueError("Mapping must contain nonempty unique episodes")
-            episodes, windows, sequences = [], [], []
-            for number, entry in enumerate(entries, 1):
-                data, action_source = _read_episode(bundle, entry, action_keys, expected_action_dim, image_source)
-                provenance = dict(data.metadata)
-                if hook:
-                    data = hook(data)
-                data = _validate_episode(data, expected_action_dim)
-                provenance["transformed"] = hook is not None
-                if hook:
-                    provenance["transform_metadata"] = data.metadata
-                    if isinstance(transform, str):
-                        transform_file = Path(transform.rpartition(":")[0]).resolve()
-                        provenance["transform_sha256"] = sha256(transform_file)
-                # Same frame count preserves source_numeric semantics for hooks.
-                if len(data.actions) != entry.get("frame_count", len(data.actions)):
-                    raise ValueError("Transform cannot change frame count; configure a new source bundle for resampling")
-                starts = window_starts(len(data.actions), horizon, stride)
-                episode_id = bundle.name + "__" + entry["new_episode"]
-                filename = "episodes/" + entry["new_episode"] + ".h5"
-                image_shape = _store_episode(root / filename, data, action_source)
-                source_uid = "sha256:" + provenance["source_action_sha256"]
-                record = {"episode_id": episode_id, "source_uid": source_uid, "split": "train", "source_role": "training",
-                          "task": provenance["task"], "bundle": bundle.name, "file": filename, "file_sha256": sha256(root / filename),
-                          "frame_count": len(data.actions), "action_dim": expected_action_dim, "action_dtype": str(data.actions.dtype),
-                          "image_shape": image_shape, "prompt": data.prompt, "provenance": provenance}
-                episodes.append(record)
-                sequences.append(data.actions)
-                for start in starts:
-                    windows.append({"sample_id": episode_id + f"__f{start:06d}", "episode_id": episode_id, "source_uid": source_uid,
-                                    "split": "train", "bundle": bundle.name, "task": record["task"], "future_start": start, "horizon": horizon,
-                                    "history_indices": history_indices(start, history_frames), "target_end_exclusive": start + horizon})
-                print(f"[{bundle.name}] {number}/{len(entries)} {entry['new_episode']}: {len(data.actions)} frames -> {len(starts)} windows", flush=True)
-            _write_manifest(root, episodes, windows, settings, sequences, [bundle.name])
+            episodes, windows, sequences, _ = _convert_bundle(bundle, root, settings, hook, transform, limit=limit)
             all_episodes.extend([{**e, "file": bundle.name + "/" + e["file"]} for e in episodes])
             all_windows.extend(windows)
             all_sequences.extend(sequences)

@@ -2,6 +2,43 @@
 
 修改数据后使用新的输出目录，并重新运行 `verify --deep`。原始 `outputs` 数据保留为可重复构建的来源。
 
+## 递归批量构建与继续
+
+多个已转换任务分散在项目目录下时，`batch` 默认递归发现转换包，每个包单独完成归档。先预检查，再构建整个转换项目：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py inspect --source-root "../robotwin-to-triworldbench" --recursive --config "./configs/conversion48.json" --limit 0
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0
+```
+
+`--limit 0` 是默认值，表示每个选中包的全部映射轨迹。使用 `--limit 1` 试构建时，每包只取一条，需使用独立调试输出，正式构建另用新目录。`inspect --recursive` 遇到首个错误就停止；实际 `batch` 会记录单包失败并继续处理其他包。
+
+`--source-root` 与 `--output-root` 不能相同，也不能处于彼此的目录树中。只识别带 `robotwin_episode_mapping.json` 的转换包；包内原始副本、Git、环境和生成的训练窗口不会再转换一遍。找到一个包就停止深入该包，处理其中映射对应的动作、指令和完整图片序列。
+
+同名目录可用源根下的相对路径选择，例如：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/selected_train48" --tasks outputs/adjust_bottle_clean50 outputs/beat_block_hammer_clean50 --config "./configs/conversion48.json" --limit 0
+```
+
+省略 `--tasks` 会处理递归发现的全部有效包，包括 smoke 和旧版包；程序不跨包自动去重，先检查扫描结果，避免重复轨迹参与训练。任务输出使用稳定 ID：直属包保留合法目录名，深层包在目录名后增加相对路径摘要，以便新增同名包后继续复用原有任务输出。
+
+失败、中断或后来新增源包时，手动再次运行原命令并加 `--resume`：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0 --resume
+```
+
+`--resume` 仅接管已有的受管理批量输出，核对源根、数据配置和完成项。源校验使用映射、指令、动作 HDF5 的摘要，以及图片大小和修改时间；输出归档重新校验摘要。有效完成包会跳过，新包或未完成包继续构建。完成源包发生变更、归档损坏时会失败，不静默修复或覆盖；数据参数、动作定义、插件改变时使用新输出版本。旧 `convert` 输出不能直接作为批量续跑目录。
+
+检查点粒度为任务包，尚未完成的包会重新构建；保留每个完成包中的 `.batch_source.json` 校验记录。若断电或强制结束进程后留下 `.batch.lock`，确认原进程已停止再删除该输出根目录中的锁文件，并用 `--resume` 继续。正常退出及 `Ctrl+C` 会释放锁。
+
+`batch_report.json` 保存本次状态、完成/失败计数、轨迹/窗口数以及 `tasks` 中每包的错误。有任一失败时退出码为 2，完成包保留；根汇总只在本次全部选中包成功后发布。新增任务更新时，旧根汇总会暂时撤下，直至 `aggregate_ready: true`。完成任务子目录仍可独立校验；联合训练读取本次成功发布的根目录。
+
+`--resume`、`--tasks` 和输出路径是命令行运行选项，不能添加到下面六键配置 JSON。`batch` 可以使用同样的 `--transform FILE:FUNCTION` 插件；首次构建与继续时需保持相同数据定义。它不会后台监视下载目录，新数据转换完成后仍需手动运行。
+
+原 `convert` 保持浅层扫描与整批原子发布：需要不存在的新输出目录，任一选中包失败会停止整批，不接受 `--resume`。只构建单包或试验新参数时，现有命令仍可使用。
+
 ## 参数文件
 
 默认文件为 `configs/conversion48.json`：
@@ -122,3 +159,5 @@ dataset = WindowDataset("datasets/train48", image_size=(256, 320))
 ## 数据版本记录
 
 一次训练建议同时保存：代码 commit、配置 JSON、插件文件、`dataset.json`、`normalizer.json`、构建 `report.json` 和 LRZ 训练配置。`--limit` 生成的是小规模调试数据，不应和正式完整训练集共用输出版本。
+
+使用批量模式时一并保存 `batch_report.json` 与完整批量输出目录。只复用未变的已完成任务时可以 `--resume`；改变历史长度、预测长度、动作或其他数据定义时另建版本。已发布的汇总和任务子目录不要重复加入同一次训练。

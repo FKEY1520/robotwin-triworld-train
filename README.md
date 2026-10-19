@@ -16,10 +16,11 @@ TriWorldBench 风格任务包：映射、动作、指令、三视角图片
 
 还没有第一步输出时，先使用 [RoboTwin → TriWorldBench 格式转换工具](https://github.com/FKEY1520/robotwin-to-triworldbench)。本仓库公开数据构建、校验和读取代码，数据格式对齐自研模型的训练约定；模型代码计划后续单独发布。
 
-第一次使用，依次完成：**安装环境 → 准备完整转换包 → 预检查 → 试构建一条 → 新目录全量构建 → 深度校验**。以下示例不要求 GPU。
+第一次使用，先完成环境安装并准备完整转换包。**转换包分散在整个项目目录时，推荐使用 `batch` 递归批量构建**；仅试构建或处理一个确定的任务包时，可使用 `convert`。两种方式都不要求 GPU。
 
 ## 目录
 
+- [0. 推荐：扫描整个项目并批量构建](#batch-build)
 - [1. 先理解几个概念与支持范围](#basics)
 - [2. 安装项目与依赖](#installation)
 - [3. 准备已经转换好的任务包](#source-data)
@@ -33,6 +34,48 @@ TriWorldBench 风格任务包：映射、动作、指令、三视角图片
 - [11. 测试、验证记录与适用范围](#verification)
 - [12. 更新代码并保留本地数据](#update-project)
 
+<a name="batch-build"></a>
+
+## 0. 推荐：扫描整个项目并批量构建
+
+完成[环境安装](#installation)后，从本项目根目录执行。`--source-root` 可以指向上一步转换工具的整个项目，而不必逐个指定 `outputs` 中的任务。下面假设两个项目仍放在并列目录：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py inspect --source-root "../robotwin-to-triworldbench" --recursive --config "./configs/conversion48.json" --limit 0
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0
+```
+
+第一条递归检查任务包；第二条实际构建。`inspect --recursive` 是严格预检，遇到首个错误会停止；`batch` 才会按包记录失败并继续处理其他包。`--limit 0` 是默认值，表示每个任务包的全部映射轨迹，不限制任务数。默认配置仍为 **9 帧历史、48 帧未来、步长 8**，末窗使用每条视频的最后 48 个真实帧。
+
+例如，项目中存在 `adjust_bottle_clean50`、`beat_block_hammer_clean50`、`beat_block_hammer_randomized500` 时，批量命令会分别处理这些包；还有其他有效包时也会一起发现。名称及其中的数字不决定实际轨迹数，结果以本次扫描和 `batch_report.json` 为准。
+
+`batch` 在找到 `robotwin_episode_mapping.json` 后，按这个包的映射、指令、数值和完整图片序列构建，随后停止深入该包。它跳过 Git、虚拟环境等基础目录，也不会把包内保留的 `source_data` 再识别为新任务。**扫描整个项目不等于把任意文件都转成训练样本**：原始 HDF5、脚本、压缩包和本项目已经生成的训练窗口目录都不是源转换包。
+
+每个任务包单独构建和保存。一个包失败时，批处理记录错误并继续其他包，已完成任务保留在输出目录中。查看 `batch_report.json` 可了解完成/失败情况和轨迹、窗口计数；存在失败时命令返回非零退出码（2）。只有本次所选任务全部成功，根目录才发布可联合读取的 `dataset.json` 等汇总文件。
+
+中断后或修复失败源包后，使用**相同源根目录、输出目录及数据配置**重新运行，并加 `--resume`：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0 --resume
+```
+
+`--resume` 只复用本工具管理的批量输出，会核对源、配置及已完成任务的校验记录，再跳过有效完成项。源检查包括映射、指令和 HDF5 摘要，以及图片大小和修改时间；已完成归档还会重新核验摘要。已完成源包发生变化或输出损坏时，该包会报错，不会自动覆盖；配置变化会拒绝继续。修复失败包后可继续，修改已完成数据或数据定义则使用新输出版本。它也不能把旧 `convert` 输出直接当作批量检查点。
+
+续跑以任务包为单位：已经完成的包复用，中断时尚未完成的包重新构建。正常退出或按 `Ctrl+C` 会释放运行锁；断电、强制结束进程后若提示输出被锁定，先确认原进程已经停止，再删除该输出根目录中的 `.batch.lock`，然后加 `--resume` 重试。不要在旧进程仍运行时删除锁。
+
+全部成功后执行深度校验：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py verify --dataset-root "./datasets/all_tasks_train48" --deep
+```
+
+源目录和输出目录必须位于彼此的目录树之外；例如源为相邻的转换项目，输出为本项目的 `datasets/`。不要把输出放到被扫描的源项目里面。`batch` 不监视下载目录：以后加入新包，仍需手动用 `--resume` 再运行，相关更新流程见[第 7 节](#multiple-tasks)。
+
+| 运行方式 | 扫描范围 | 出错与再次运行 |
+| --- | --- | --- |
+| `convert` | 指定包，或源根的直接子包。 | 本批原子构建；任一失败整批停止；需要不存在的新输出目录。 |
+| `batch` | 默认递归扫描整个源项目。 | 按包保存进度并继续处理其他包；已有批量输出使用 `--resume` 校验后继续。 |
+
 <a name="basics"></a>
 
 ## 1. 先理解几个概念与支持范围
@@ -40,7 +83,7 @@ TriWorldBench 风格任务包：映射、动作、指令、三视角图片
 | 名称 | 在本项目中的含义 |
 | --- | --- |
 | 任务（task） | 一类机器人操作，例如 `adjust_bottle`。 |
-| 转换包（bundle） | 上一步生成的完整目录，例如 `adjust_bottle_clean50`；`--tasks` 使用这个目录名。 |
+| 转换包（bundle） | 上一步生成的完整目录，例如 `adjust_bottle_clean50`；递归扫描中可用相对于源根的路径选择。 |
 | 轨迹（episode） | 一次任务执行记录，包含时间对齐的动作和三视角图片。 |
 | 时间帧数 `T` | 一条轨迹的同步时刻数；三视角各有 `T` 张图片，共 `3T` 张。 |
 | 历史长度 `P` | 每个样本输入的历史帧数，对应 `--history-frames`，默认 9。 |
@@ -52,6 +95,8 @@ TriWorldBench 风格任务包：映射、动作、指令、三视角图片
 默认输入约定是三视角 `head, left, right`、14 维动作字段 `joint_action/vector`。图片需要是 RGB，同一条轨迹内所有视角、所有帧的分辨率一致；本项目归档时保留原分辨率。
 
 源 HDF5 的**全部数值字段**都需要逐帧对齐，且数值不能含 NaN、无穷大或复数，包括未选择的动作字段和源 `joint_action/vector`。每条轨迹必须有有效指令，以及完整且连续编号的图片序列。只有首帧、MP4 或一份动作文件，都不足以构建本项目的数据集。
+
+递归预检和批量模式还会检查 `test_dataset/data/` 的 episode HDF5 是否与映射一致；存在未映射的额外 episode 文件时会报错。先检查上一步转换是否完整，不能靠扫描任意 HDF5 自动补建任务。
 
 当前训练数据约定要求：`H` 为正的 4 的倍数，`P` 为 `4n+1`（1、5、9、……），`1 ≤ S ≤ H`，每条轨迹至少有 `H+1` 帧。默认需要 **至少 49 帧**，历史不足可以重复帧 0，未来目标始终使用真实帧。
 
@@ -145,7 +190,7 @@ your_workspace/
 
 上图只展开一条轨迹和每个视角的首张图片；实际需要映射中所有选中轨迹的全部动作、指令和连续图片。保留上一步的完整任务包，不要只复制 `test_dataset/first_frame/`。其他上游文件可以保留，本工具按所需路径读取。
 
-`--source-root` 可以指向含多个任务包的父目录，也可以直接指向一个含 `robotwin_episode_mapping.json` 的任务包。父目录扫描只识别直接子目录，不会递归搜索任意深度。`--tasks` 筛选的是包目录名，例如 `adjust_bottle_clean50`，不是内部任务标签 `adjust_bottle`。
+`--source-root` 可以指向含多个任务包的父目录，也可以直接指向一个含 `robotwin_episode_mapping.json` 的任务包。`convert` 和普通 `inspect` 只识别源根及其直接子包；`batch` 默认递归，`inspect --recursive` 可预检查同样的目录树。`--tasks` 选择转换包，不是内部任务标签 `adjust_bottle`；递归扫描存在同名目录时应使用源根下的相对路径，例如 `outputs/adjust_bottle_clean50`。
 
 指令文件需要是已选定的 JSON 字符串，或 `{"instruction":"..."}`，并与映射中的已选指令一致。本工具沿用上一步选择的句子，不会重新从 `seen` / `unseen` 候选中选择。
 
@@ -166,7 +211,7 @@ your_workspace/
 .\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py --help
 ```
 
-帮助中应列出 `inspect`、`convert`、`verify`、`export-npz`。如果无法找到脚本，先回到含 `convert_dataset.py` 的目录。
+帮助中应列出 `inspect`、`convert`、`batch`、`verify`、`export-npz`。如果无法找到脚本，先回到含 `convert_dataset.py` 的目录。
 
 ### 4.2 预检查全部选中轨迹
 
@@ -194,7 +239,7 @@ your_workspace/
 .\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py verify --dataset-root "./datasets/adjust_bottle_train48_v1" --deep --report "./reports/adjust_bottle_train48_v1_verify.json"
 ```
 
-全量构建重新包含试构建的那条轨迹；它不只处理“剩余数据”。所有选中轨迹都必须成功，任意一条失败会停止本批构建，没有自动跳过、追加或续转模式。输出先写入旁边的 `.partial-...` 临时目录，全部完成后才发布为正式目录。
+这里的 `convert` 全量构建重新包含试构建的那条轨迹；它不只处理“剩余数据”。所有选中轨迹都必须成功，任意一条失败会停止本批原子构建，`convert` 没有追加或续转模式。输出先写入旁边的 `.partial-...` 临时目录，全部完成后才发布为正式目录。需要按任务保留进度时使用[批量模式](#batch-build)。
 
 输出目录必须不存在，且不能放在源目录内部或作为源目录的父目录。再次运行请使用新的版本名，例如 `adjust_bottle_train48_v2`；不要预先手动创建最终输出目录。
 
@@ -215,6 +260,14 @@ Set-Location -LiteralPath "A:\Triworldbench训练数据集"
 ```
 
 正式构建时沿用同一绝对 `--source-root`，输出仍选择新的目录。这里是已有本地环境的示例，克隆仓库不会自动得到这些路径、源数据或已生成训练集。
+
+要递归扫描这个转换项目的所有任务，源根改为项目本身：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "A:\robotwin_to_Triworldbench_github_ALOHA\robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0
+```
+
+首次输出须不存在；继续同一个批次时给这条命令追加 `--resume`。不要同时启动两次相同输出目录的构建。
 
 <a name="window-rules"></a>
 
@@ -302,6 +355,29 @@ print(sample["prompt"])
 
 完整复制汇总目录及其子目录，即可搬运全部任务；单独复制一个完整任务子目录也可读取。路径引用是相对路径，图片已经归档，搬到其他机器后不要求原始源目录存在。移动后再运行 `verify --deep`。
 
+### 批量模式的目录与报告
+
+`batch` 的任务子目录使用稳定 ID。源根的直属包通常保留目录名；更深层的包使用 `包名--相对路径摘要`，即使后来出现同名包，也不改变已有任务 ID。任务选择仍使用源相对路径，而非猜测输出 ID。
+
+```text
+datasets/all_tasks_train48/
+├── batch_state.json                     # 续跑状态，保留且不要手改
+├── batch_report.json                    # 每次批量运行的结果与错误
+├── dataset.json                         # 本次所选任务全部成功后发布
+├── windows.jsonl
+├── normalizer.json
+├── report.json
+└── <稳定任务ID>/
+    ├── .batch_source.json               # 续跑来源校验记录，完整复制时保留
+    ├── dataset.json
+    ├── windows.jsonl
+    ├── normalizer.json
+    ├── report.json
+    └── episodes/*.h5
+```
+
+`batch_report.json` 中 `aggregate_ready: true` 表示本次汇总入口已就绪；`completed_count` 包含新完成及复用成功的任务，`converted_count` 是本次新构建数，`skipped_count` 是校验后复用数，`failed_count` 是失败数，`tasks` 记录各包状态与 `error`。存在失败时根汇总不发布，已完成任务子目录仍可单独校验和读取。若包全部完成但汇总出错，查看 `aggregate_error`。`--limit 1` 也可以得到完整的调试批次，但它只包含每个包的一条轨迹，不是全量数据。
+
 <a name="multiple-tasks"></a>
 
 ## 7. 新增任务与多任务训练
@@ -311,7 +387,8 @@ print(sample["prompt"])
 ```text
 robotwin-to-triworldbench/outputs/
 ├── adjust_bottle_clean50/
-└── beat_block_hammer_clean50/
+├── beat_block_hammer_clean50/
+└── beat_block_hammer_randomized500/
 ```
 
 只有实际存在第二个包时，才将下面的包名用于命令。先检查，再生成新任务的独立输出：
@@ -321,19 +398,27 @@ robotwin-to-triworldbench/outputs/
 .\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py convert --source-root "../robotwin-to-triworldbench/outputs" --tasks beat_block_hammer_clean50 --output-root "./datasets/beat_block_hammer_train48_v1" --config "./configs/conversion48.json" --limit 0
 ```
 
-联合训练建议明确列出正式包，使用新的输出目录：
+联合训练可以明确列出正式包；递归扫描用相对于源项目根目录的路径：
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py inspect --source-root "../robotwin-to-triworldbench/outputs" --tasks adjust_bottle_clean50 beat_block_hammer_clean50 --config "./configs/conversion48.json" --limit 0
-.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py convert --source-root "../robotwin-to-triworldbench/outputs" --tasks adjust_bottle_clean50 beat_block_hammer_clean50 --output-root "./datasets/all_tasks_train48_v2" --config "./configs/conversion48.json" --limit 0
-.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py verify --dataset-root "./datasets/all_tasks_train48_v2" --deep
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py inspect --source-root "../robotwin-to-triworldbench" --recursive --tasks outputs/adjust_bottle_clean50 outputs/beat_block_hammer_clean50 --config "./configs/conversion48.json" --limit 0
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --tasks outputs/adjust_bottle_clean50 outputs/beat_block_hammer_clean50 --output-root "./datasets/selected_tasks_train48_v1" --config "./configs/conversion48.json" --limit 0
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py verify --dataset-root "./datasets/selected_tasks_train48_v1" --deep
 ```
 
-省略 `--tasks` 会扫描源根目录全部直属有效包，**包括放在其中的 smoke、旧版或重复转换包**，不会自动去重。使用自动全扫前，确保源目录只放本次所需正式包，并先用相同参数执行 `inspect`。重复包会让同一轨迹多次参与训练和统计。
+`--tasks` 可以用唯一的包名简写，但多处同名时必须给相对路径，程序会列出可选路径。目录名不同的重复数据、smoke 和旧版包不会自动去重；全项目自动扫描也会发现这些有效包。联合训练前用 `inspect --recursive` 核对列表，选择本次所需正式包，避免同一轨迹多次参与训练和统计。
 
 联合输出的根清单包含所有选中任务，各任务子目录仍然独立。联合训练读取根目录，单任务训练读取对应子目录。不要同时把根目录、它的任务子目录、旧版本和 smoke 输出一起加入训练，否则会重复使用同一批轨迹。
 
-本工具没有目录监视或自动更新功能。放入新包后需要手动再次运行；它不向已有训练集追加，也不覆盖旧输出。单独使用新任务时构建新目录，联合使用新旧任务时从源包重新构建新版本。
+后来把新包放入同一个源项目后，要更新第 0 节的批量输出，可再次运行：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 .\convert_dataset.py batch --source-root "../robotwin-to-triworldbench" --output-root "./datasets/all_tasks_train48" --config "./configs/conversion48.json" --limit 0 --resume
+```
+
+它重新发现本次源包，校验后复用未变的完成任务，构建新增或此前未完成的包，再重建本次所选任务的汇总。若最初使用了 `--tasks`，更新时也要明确选择所需的新旧包。新增任务处理期间旧根汇总暂时撤下，只有本次全部成功后才再次发布；以 `batch_report.json` 的 `aggregate_ready` 为准，不把上次的成功报告当成本次完成。
+
+本工具没有目录监视或后台自动更新功能。放入新包后需要手动运行；`convert` 仍要求新的输出目录，只有 `batch --resume` 可以继续本工具已有的批量输出。已完成源包或配置改变时应使用新输出版本，不覆盖旧数据。
 
 <a name="customization"></a>
 
@@ -425,15 +510,16 @@ def customize_episode(episode):
 | --- | --- | --- |
 | `inspect` | `--source-root` | 读取源包并规划窗口，不创建数据集。 |
 | `convert` | `--source-root`、`--output-root` | 构建 episode 归档、窗口和动作统计。 |
+| `batch` | `--source-root`、`--output-root` | 递归发现源包，逐包构建并记录可继续的进度。 |
 | `verify` | `--dataset-root` | 验证已经生成的数据集。 |
 | `export-npz` | `--dataset-root`、`--output-root` | 将窗口展开为便于检查的 NPZ 文件。 |
 
-`inspect` / `convert` 共用参数：
+`inspect` / `convert` / `batch` 共用参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--source-root` | 必填 | 一个任务包，或包含多个任务包的父目录。 |
-| `--tasks NAME [NAME ...]` | 全部可识别包 | 按包目录名选择一个或多个，未知名称会报错。 |
+| `--source-root` | 必填 | 一个任务包、包父目录；批量递归时可使用整个转换项目。 |
+| `--tasks NAME [NAME ...]` | 全部可识别包 | 按包名或源相对路径选择；递归扫描中同名时用相对路径消歧。 |
 | `--config FILE` | 无 | JSON 参数文件，仅接受第 8 节六个键。 |
 | `--limit N` | `0` | **每个选中任务包**最多读取的 episode 数；0 为全部。 |
 | `--horizon H` | `48` | 正的 4 的倍数；真实连续未来图像目标长度。 |
@@ -443,7 +529,15 @@ def customize_episode(episode):
 | `--action-key KEY` | `joint_action/vector` | 可重复，按顺序拼接；JSON 键为 `action_keys`。 |
 | `--action-dim D` | `14` | 拼接后预期维数；JSON 键为 `expected_action_dim`。 |
 
-仅 `convert` 接受 `--output-root`（新输出目录）和 `--transform FILE:FUNCTION`（可选插件）。`inspect` 不接受这两个参数，也不会执行转换插件。
+`convert` 和 `batch` 接受 `--output-root`（输出目录）与 `--transform FILE:FUNCTION`（可选插件）。`inspect` 不接受这两个参数，也不会执行转换插件。`--recursive` 和 `--resume` 属于运行方式参数，不能写入六键配置 JSON。
+
+| 扫描与继续参数 | 说明 |
+| --- | --- |
+| `inspect --recursive` | 递归预检查；默认 inspect 仍只扫描源根及直接子包，遇错立即停止。 |
+| `batch` 默认扫描方式 | 递归；不需要额外 `--recursive`，默认 `--limit 0` 为每包全部轨迹。 |
+| `batch --resume` | 明确继续已存在的受管理批量输出；验证源、数据配置及完成归档后跳过有效完成项。 |
+| `convert --output-root DIR` | 必须不存在；不接受 `--resume`。 |
+| `batch --output-root DIR` | 首次必须不存在，后续相同批量目录显式使用 `--resume`；不能接管任意旧目录。 |
 
 | 其他子命令参数 | 说明 |
 | --- | --- |
@@ -474,10 +568,13 @@ NPZ 包含 `history_video`、`future_video`、`packed_actions` 和 `metadata_jso
 | 预检查通过，正式构建图片报错 | `inspect` 不解码所有图片；检查错误帧是否损坏、非 RGB 或尺寸不一致。 |
 | `Need at least ... real frames` | 默认每条至少 49 帧。可选符合约束的较短 `H`，并同步训练配置；不能补造未来目标。 |
 | 动作维数不符 | 对照 `inspect` 字段与列数，核对动作选择和 `--action-dim`，不要仅改维数参数掩盖不同动作含义。 |
-| `Refusing to overwrite ...` | 输出目录已经存在；使用新的版本目录。转换器也不向已有目录追加。 |
+| `Refusing to overwrite ...` | `convert` 使用新的版本目录；已有受管理批量目录用相同 batch 参数加 `--resume`，不能拿它覆盖任意旧输出。 |
 | SHA-256 或窗口一致性校验失败 | 检查传输完整性及是否手动改过文件，优先从可信源恢复或用原配置重新构建。 |
 | 改了窗口参数但数量没有变化 | 确认读的是本次新输出，查看 `report.json` 中 `settings`；重跑 inspect 时也要提供相同参数。 |
-| 是否自动处理后来下载的数据 | 不会。先完成上一步格式转换，再按第 7 节手动选择新包或重建联合版本。 |
+| 批量报告里有失败，其他包是否白跑 | 不会。完成包已保留，先查看 `tasks[*].error`，修复未完成源包后用同一命令加 `--resume`。 |
+| resume 提示已完成源包变化或归档损坏 | 不会静默重建或覆盖；恢复原文件，或使用新输出版本完整构建。改变数据配置也使用新版本。 |
+| batch 有任务子目录但根清单不存在 | 本次仍有未完成/失败任务，查看 `batch_report.json`；全部成功后才发布联合训练入口。 |
+| 是否自动处理后来下载的数据 | 不会后台监视。先完成上一步格式转换，再按第 7 节手动 `batch --resume` 或使用新输出版本。 |
 | 是否可以直接开始模型训练 | 本仓库完成数据构建和读取。训练入口需要按相同数据约定接入，模型代码后续单独发布。 |
 
 命令出现 `ERROR:` 或非零退出码时应停止后续步骤，先处理原因。已捕获的构建错误会清理本次临时目录；强制中止或断电可能留下 `.partial-...`，它不是可训练的完整输出。

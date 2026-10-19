@@ -11,11 +11,11 @@ from .verify import verify, export_npz
 def main(argv=None):
     parser = argparse.ArgumentParser(description="RoboTwin -> TriViewWan 1.0 training datasets (all train, real future frames)")
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("inspect", "convert"):
+    for command in ("inspect", "convert", "batch"):
         p = sub.add_parser(command)
         p.add_argument("--source-root", required=True)
         p.add_argument("--config", help="JSON defaults; explicit command flags take precedence")
-        p.add_argument("--tasks", nargs="+", help="Converted bundle directory names")
+        p.add_argument("--tasks", nargs="+", help="Bundle names; recursive scans also accept source-relative paths")
         p.add_argument("--limit", type=int, default=0, help="Episodes PER task; 0 means all")
         p.add_argument("--horizon", type=int)
         p.add_argument("--stride", type=int)
@@ -23,9 +23,13 @@ def main(argv=None):
         p.add_argument("--image-source", choices=("auto", "png", "jpg"))
         p.add_argument("--action-key", action="append", dest="action_keys")
         p.add_argument("--action-dim", type=int, dest="expected_action_dim")
-        if command == "convert":
+        if command in ("convert", "batch"):
             p.add_argument("--output-root", required=True)
             p.add_argument("--transform", help="Trusted local .py:function; runs user Python code")
+        if command == "inspect":
+            p.add_argument("--recursive", action="store_true", help="Recursively discover converted bundles; stop inside each bundle")
+        if command == "batch":
+            p.add_argument("--resume", action="store_true", help="Verify and reuse completed tasks in a matching batch output")
     p = sub.add_parser("verify")
     p.add_argument("--dataset-root", required=True)
     p.add_argument("--deep", action="store_true", help="Decode every stored image as well as check SHA-256")
@@ -39,7 +43,7 @@ def main(argv=None):
     args = vars(parser.parse_args(argv))
     command = args.pop("command")
     try:
-        if command in ("convert", "inspect"):
+        if command in ("convert", "inspect", "batch"):
             config_file = args.pop("config")
             config = read_json(config_file) if config_file else {}
             defaults = {"horizon": 48, "stride": 8, "history_frames": 9, "image_source": "auto", "action_keys": [ACTION_KEY], "expected_action_dim": 14}
@@ -48,7 +52,11 @@ def main(argv=None):
             for key, default in defaults.items():
                 if args.get(key) is None:
                     args[key] = config.get(key, default)
-            result = (convert if command == "convert" else inspect)(**args)
+            if command == "batch":
+                from .batch import batch_convert
+                result = batch_convert(**args)
+            else:
+                result = (convert if command == "convert" else inspect)(**args)
         elif command == "verify":
             report = args.pop("report")
             result = verify(**args)
@@ -60,7 +68,7 @@ def main(argv=None):
                 raise ValueError("Provide both --height and --width")
             result = export_npz(**args, image_size=(height, width) if height is not None else None)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
-        return 0
+        return 2 if command == "batch" and not result["passed"] else 0
     except (OSError, ValueError, KeyError, TypeError, ImportError, AttributeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
